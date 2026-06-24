@@ -2,4 +2,6 @@
 bin
 obj
 PublishProfiles
+publish
 test
+*.pfx
