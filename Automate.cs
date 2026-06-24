@@ -112,6 +112,10 @@ namespace LCPSAutomate
                 _logger.Error(ex, "初始化数据库失败");
             }
             StartFileWatcher();
+            await InitializeBaselineAsync();
+            // 基线已就绪，现在才允许 watcher 触发事件 & 启动轮询线程
+            if (_watcher != null) _watcher.EnableRaisingEvents = true;
+            _logger.Info("FileSystemWatcher 事件已开启");
             _pollTask = Task.Run(() => PollDirectoryLoopAsync(_cts.Token), _cts.Token);
             _logger.Info("Automate started.");
         }
@@ -152,27 +156,60 @@ namespace LCPSAutomate
             _watcher.Created += OnCreated;
             _watcher.Renamed += OnRenamed;
             _watcher.Error += OnWatcherError;
-            _watcher.EnableRaisingEvents = true;
-            _logger.Info($"FileSystemWatcher 已启动 | 目录={di.FullName} 过滤=*.txt 缓冲区=64KB 通知项=FileName|LastWrite|CreationTime|Size");
+            // 注意：EnableRaisingEvents 不在这里打开。先让 InitializeBaselineAsync 把已有文件
+            // 的基线位置设好，再开事件，避免基线设好之前 OnFileChanged 用 0 把历史全读一遍。
+            _logger.Info($"FileSystemWatcher 已注册回调（事件待基线就绪后开启）| 目录={di.FullName} 过滤=*.txt 缓冲区=64KB");
+        }
 
-            // 启动时扫一遍现有 .txt，把每个文件交给处理管道走一次
-            // —— 这样程序启动前就已经存在的、或启动期间错过事件的文件也能被消费
+        // 启动基线：对程序启动前已经存在的 .txt 文件，把"当前末尾"作为基线位置，
+        // 之后任何 append 都视为新内容；新文件（启动后才出现的）走 OnCreated/Poll-New，
+        // 默认从 0 开始读，行为不变。
+        // 已经在数据库里有 LastPosition 的文件（上次跑过）保留 resume 行为。
+        private async Task InitializeBaselineAsync()
+        {
+            var di = new DirectoryInfo(_directory);
+            if (!di.Exists) return;
+
             try
             {
                 var existing = di.EnumerateFiles("*.txt").ToList();
-                _logger.Info($"启动扫描：发现 {existing.Count} 个 .txt 文件");
+                _logger.Info($"启动基线扫描：发现 {existing.Count} 个 .txt 文件（程序启动前已存在的内容不会被消费）");
                 foreach (var f in existing)
                 {
-                    _readRecors.TryAdd(f.FullName, 0);
                     _pollState[f.FullName] = (f.Length, f.LastWriteTimeUtc);
-                    var lastPos = _readRecors.TryGetValue(f.FullName, out var p) ? p : 0;
-                    _logger.Info($"  [Startup] {f.Name} 大小={f.Length} 已读={lastPos} 修改={f.LastWriteTime:HH:mm:ss.fff}");
-                    QueueHandle(f.FullName, "Startup");
+
+                    // 数据库里已有位置 → 用历史位置 resume（旧行为）
+                    // 数据库里没有 → 把当前末尾作为基线（新行为：跳过历史内容）
+                    if (_readRecors.TryGetValue(f.FullName, out var resumed))
+                    {
+                        _logger.Info($"  [Baseline-Resume] {f.Name} 大小={f.Length} 从历史位置={resumed} 继续");
+                    }
+                    else
+                    {
+                        _readRecors[f.FullName] = f.Length;
+                        _logger.Info($"  [Baseline-Skip] {f.Name} 大小={f.Length} 历史内容跳过，基线设为末尾={f.Length}");
+                        // 持久化基线，避免重启又重新设一遍（且让 HandleFileChangeAsync 不需要特判）
+                        try
+                        {
+                            if (_db != null)
+                            {
+                                await _db.UpsertFileReadRecordAsync(new FileReadRecord
+                                {
+                                    FilePath = f.FullName,
+                                    LastPosition = f.Length
+                                });
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.Error(ex, $"持久化基线位置失败: {f.FullName}");
+                        }
+                    }
                 }
             }
             catch (Exception ex)
             {
-                _logger.Error(ex, "启动扫描目录失败");
+                _logger.Error(ex, "启动基线扫描失败");
             }
         }
 
