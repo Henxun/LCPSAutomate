@@ -153,14 +153,27 @@ namespace LCPSAutomate
                 throw;
             }
 
-            _handleTask = Task.Run(() => ProcessNewContent(_cts.Token), _cts.Token);
-            StartFileWatcher();
-            await InitializeBaselineAsync();
-            // 基线已就绪，现在才允许 watcher 触发事件 & 启动轮询线程
-            if (_watcher != null) _watcher.EnableRaisingEvents = true;
-            _logger.Info("FileSystemWatcher 事件已开启");
-            _pollTask = Task.Run(() => PollDirectoryLoopAsync(_cts.Token), _cts.Token);
-            _logger.Info("Automate started.");
+            try
+            {
+                StartFileWatcher();
+                await InitializeBaselineAsync();
+                // 基线完整持久化后才启动 watcher、消费线程和轮询，避免启动阶段处理旧文件。
+                if (_watcher != null) _watcher.EnableRaisingEvents = true;
+                _logger.Info("FileSystemWatcher 事件已开启");
+                _handleTask = Task.Run(() => ProcessNewContent(_cts.Token), _cts.Token);
+                _pollTask = Task.Run(() => PollDirectoryLoopAsync(_cts.Token), _cts.Token);
+                _logger.Info("Automate started.");
+            }
+            catch
+            {
+                _watcher?.Dispose();
+                _watcher = null;
+                _db?.Dispose();
+                _db = null;
+                _cts.Dispose();
+                _cts = null;
+                throw;
+            }
         }
 
         public void Stop()
@@ -204,10 +217,9 @@ namespace LCPSAutomate
             _logger.Info($"FileSystemWatcher 已注册回调（事件待基线就绪后开启）| 目录={di.FullName} 过滤=*.txt 缓冲区=64KB");
         }
 
-        // 启动基线：对程序启动前已经存在的 .txt 文件，把"当前末尾"作为基线位置，
-        // 之后任何 append 都视为新内容；新文件（启动后才出现的）走 OnCreated/Poll-New，
-        // 默认从 0 开始读，行为不变。
-        // 已经在数据库里有 LastPosition 的文件（上次跑过）保留 resume 行为。
+        // 启动基线：程序启动前已经存在的所有 .txt 文件，一律把“当前末尾”作为基线。
+        // 不再从数据库中的历史位置回读旧文件；即使 FileSystemWatcher 在启用后产生延迟/伪事件，
+        // 也只能从本次启动时的末尾继续读取。启动后新建的文件仍从 0 开始读取。
         private async Task InitializeBaselineAsync()
         {
             var di = new DirectoryInfo(_directory);
@@ -216,43 +228,42 @@ namespace LCPSAutomate
             try
             {
                 var existing = di.EnumerateFiles("*.txt").ToList();
-                _logger.Info($"启动基线扫描：发现 {existing.Count} 个 .txt 文件（程序启动前已存在的内容不会被消费）");
+                _logger.Info($"启动基线扫描：发现 {existing.Count} 个 .txt 文件（全部跳过启动前的历史内容）");
                 foreach (var f in existing)
                 {
                     _pollState[f.FullName] = (f.Length, f.LastWriteTimeUtc);
+                    var hadPreviousPosition = _readRecors.TryGetValue(f.FullName, out var previousPosition);
 
-                    // 数据库里已有位置 → 用历史位置 resume（旧行为）
-                    // 数据库里没有 → 把当前末尾作为基线（新行为：跳过历史内容）
-                    if (_readRecors.TryGetValue(f.FullName, out var resumed))
+                    // 无论数据库中是否存在旧位置，都覆盖为本次启动时的文件末尾。
+                    _readRecors[f.FullName] = f.Length;
+                    _logger.Info(
+                        $"  [Baseline-Skip] {f.Name} 大小={f.Length} " +
+                        $"历史位置={(hadPreviousPosition ? previousPosition : "<none>")} -> 启动基线={f.Length}");
+
+                    try
                     {
-                        _logger.Info($"  [Baseline-Resume] {f.Name} 大小={f.Length} 从历史位置={resumed} 继续");
+                        if (_db == null)
+                        {
+                            throw new InvalidOperationException("数据库未初始化，无法保存启动基线");
+                        }
+
+                        await _db.UpsertFileReadRecordAsync(new FileReadRecord
+                        {
+                            FilePath = f.FullName,
+                            LastPosition = f.Length
+                        });
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        _readRecors[f.FullName] = f.Length;
-                        _logger.Info($"  [Baseline-Skip] {f.Name} 大小={f.Length} 历史内容跳过，基线设为末尾={f.Length}");
-                        // 持久化基线，避免重启又重新设一遍（且让 HandleFileChangeAsync 不需要特判）
-                        try
-                        {
-                            if (_db != null)
-                            {
-                                await _db.UpsertFileReadRecordAsync(new FileReadRecord
-                                {
-                                    FilePath = f.FullName,
-                                    LastPosition = f.Length
-                                });
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.Error(ex, $"持久化基线位置失败: {f.FullName}");
-                        }
+                        _logger.Error(ex, $"持久化启动基线失败: {f.FullName}");
+                        throw;
                     }
                 }
             }
             catch (Exception ex)
             {
                 _logger.Error(ex, "启动基线扫描失败");
+                throw;
             }
         }
 
@@ -302,6 +313,14 @@ namespace LCPSAutomate
             Task.Run(async () =>
             {
                 await Task.Delay(150); // 等待写入结束
+
+                // FileSystemWatcher 偶尔会在刚启用时产生延迟/伪事件。只有文件元数据相对
+                // 启动基线确实发生变化时才打开文件；Poll 来源已经在轮询中完成了该判断。
+                if (!source.StartsWith("Poll", StringComparison.Ordinal) && !UpdateSnapshotIfChanged(fullPath, source))
+                {
+                    return;
+                }
+
                 if (!_readRecors.ContainsKey(fullPath))
                 {
                     _readRecors.TryAdd(fullPath, 0);
@@ -329,7 +348,39 @@ namespace LCPSAutomate
             });
         }
 
+        private bool UpdateSnapshotIfChanged(string fullPath, string source)
+        {
+            try
+            {
+                var file = new FileInfo(fullPath);
+                if (!file.Exists)
+                {
+                    _logger.Debug($"[{source}] 文件已不存在，忽略事件: {fullPath}");
+                    return false;
+                }
+
+                file.Refresh();
+                var current = (file.Length, file.LastWriteTimeUtc);
+                if (_pollState.TryGetValue(fullPath, out var previous) &&
+                    previous.Length == current.Length &&
+                    previous.LastWriteUtc == current.LastWriteTimeUtc)
+                {
+                    _logger.Debug($"[{source}] 文件元数据相对基线未变化，忽略延迟/伪事件: {fullPath}");
+                    return false;
+                }
+
+                _pollState[fullPath] = current;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(ex, $"[{source}] 校验文件变化失败，将交给读取流程处理: {fullPath}");
+                return true;
+            }
+        }
+
         // 轮询兜底：每 PollInterval 扫描一次目录，对比 Length / LastWriteTimeUtc，
+
         // 任何变化都走 QueueHandle。即使 FileSystemWatcher 因某些原因沉默（驱动/杀软 hook、
         // 缓冲区已溢出、服务用了奇怪的 IO 模式），轮询也能补上事件，最大延迟 = PollInterval。
         private async Task PollDirectoryLoopAsync(CancellationToken ct)
