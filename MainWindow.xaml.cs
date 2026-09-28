@@ -26,14 +26,9 @@ namespace LCPSAutomate
 
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
-            Task.Run(() =>
-            {
-                var isReady = FlaUIUitls.DetectWindow();
-                OnStatusChanged(isReady);
-            });
+            // MonitorWindowLoopAsync 会立即执行首次检测，不再并行启动第二次 UIA 检测。
             Task.Run(() => MonitorWindowLoopAsync(_cts.Token), _cts.Token);
             _logger.Info("应用程序已启动");
-            
         }
 
         private void StartButton_Click(object sender, RoutedEventArgs e)

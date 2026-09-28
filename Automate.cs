@@ -532,9 +532,12 @@ namespace LCPSAutomate
             for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
                 var enterPressed = false;
+                var automationGateAcquired = false;
                 try
                 {
                     ct.ThrowIfCancellationRequested();
+                    await FlaUIUitls.AutomationGate.WaitAsync(ct);
+                    automationGateAcquired = true;
                     using var automation = new UIA3Automation();
                     var desktop = automation.GetDesktop();
                     var winElement = desktop.FindFirstChild(cf =>
@@ -604,6 +607,13 @@ namespace LCPSAutomate
                     if (attempt < maxAttempts)
                     {
                         await Task.Delay(500, ct);
+                    }
+                }
+                finally
+                {
+                    if (automationGateAcquired)
+                    {
+                        FlaUIUitls.AutomationGate.Release();
                     }
                 }
             }
