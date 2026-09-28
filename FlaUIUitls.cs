@@ -40,7 +40,8 @@ namespace LCPSAutomate
             }
             catch (Exception ex)
             {
-                logger.Error("监测循环异常: " + ex.Message);
+                // UI Automation 偶尔会出现瞬时 COM 错误；调用方会按连续失败阈值决定是否停机。
+                logger.Error(ex, "监测循环异常");
                 isReady = false;
             }
             return isReady;

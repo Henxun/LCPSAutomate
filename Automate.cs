@@ -18,6 +18,7 @@ namespace LCPSAutomate
         private FileSystemWatcher? _watcher;
         private ConcurrentDictionary<string, long> _readRecors = new ConcurrentDictionary<string, long>();
         private ConcurrentQueue<string> _queue = new ConcurrentQueue<string>();
+        private ConcurrentDictionary<string, byte> _scheduledQrs = new ConcurrentDictionary<string, byte>();
         private Task? _handleTask;
         private Task? _pollTask;
         private SqliteDataAccess? _db;
@@ -48,28 +49,56 @@ namespace LCPSAutomate
         private async Task ProcessNewContent(CancellationToken ct)
         {
             _logger.Info("消费线程启动");
-            while(!ct.IsCancellationRequested)
+            while (!ct.IsCancellationRequested)
             {
-
-                if (_queue.TryDequeue(out var content))
+                if (_queue.TryDequeue(out var qr))
                 {
-                    var qrList = ExtractQR(content).ToList();
-                    _logger.Info($"[Consume] 出队一段内容 长度={content.Length} 提取QR={qrList.Count} 剩余队列≈{_queue.Count}");
-                    if (qrList.Count > 0)
+                    _logger.Info($"[Consume] 开始处理 QR={DescribeQr(qr)} 剩余队列≈{_queue.Count}");
+                    try
                     {
-                        await Submit(qrList);
+                        await SubmitQrAsync(qr, ct);
                     }
-                    else
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
                     {
-                        _logger.Debug("[Consume] 内容中无 QR 匹配，跳过提交");
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error(ex, $"[Consume] QR 提交出现未处理异常 QR={DescribeQr(qr)}");
+                        await SaveSubmitFailureAsync(qr, $"未处理异常: {ex.GetType().Name}: {ex.Message}");
+                    }
+                    finally
+                    {
+                        _scheduledQrs.TryRemove(qr, out _);
                     }
                 }
                 else
                 {
-                    await Task.Delay(500);
+                    try { await Task.Delay(500, ct); }
+                    catch (TaskCanceledException) { break; }
                 }
             }
             _logger.Info("消费线程已退出");
+        }
+
+        private void EnqueuePendingQr(string qr, string source)
+        {
+            if (_scheduledQrs.TryAdd(qr, 0))
+            {
+                _queue.Enqueue(qr);
+                _logger.Debug($"[{source}] QR 已进入提交队列 QR={DescribeQr(qr)} 队列长度≈{_queue.Count}");
+            }
+            else
+            {
+                _logger.Debug($"[{source}] QR 已在队列或正在提交，跳过重复调度 QR={DescribeQr(qr)}");
+            }
+        }
+
+        private static string DescribeQr(string qr)
+        {
+            if (string.IsNullOrEmpty(qr)) return "<empty>";
+            if (qr.Length <= 16) return $"{qr}(len={qr.Length})";
+            return $"{qr[..8]}...{qr[^8..]}(len={qr.Length})";
         }
 
         private IEnumerable<string> ExtractQR(string text)
@@ -89,19 +118,26 @@ namespace LCPSAutomate
             if (_cts != null) throw new InvalidOperationException("Already started.");
             _logger.Info($"==== Automate 启动 ==== 目录={_directory} 轮询间隔={PollInterval.TotalSeconds}s");
             _cts = new CancellationTokenSource();
-            _handleTask = Task.Run(() => ProcessNewContent(_cts.Token), _cts.Token);
-            // 初始化数据库（放在 Start 中，使用目录下的文件）
+
             try
             {
                 _db = new SqliteDataAccess();
 
-                // 尝试从数据库恢复每个已知文件的上次读取位置
+                // 恢复每个已知文件的读取位置。
                 var records = await _db.GetFileReadRecordsAsync();
                 foreach (var rec in records)
                 {
                     _readRecors.TryAdd(rec.FilePath, rec.LastPosition);
                 }
-                _logger.Info($"数据库初始化完成，恢复 {records.Count} 个文件的读取位置");
+
+                // 先恢复数据库中的待提交 QR，再启动消费线程。这样异常退出后不会丢失提交任务。
+                var pendingRecords = (await _db.GetUnprocessedRecordsAsync()).ToList();
+                foreach (var pending in pendingRecords)
+                {
+                    EnqueuePendingQr(pending.Qr, "Startup-Recovery");
+                }
+
+                _logger.Info($"数据库初始化完成，恢复 {records.Count} 个文件读取位置、{pendingRecords.Count} 个待提交 QR");
                 foreach (var rec in records)
                 {
                     _logger.Debug($"  恢复位置: {rec.FilePath} @ {rec.LastPosition}");
@@ -109,8 +145,15 @@ namespace LCPSAutomate
             }
             catch (Exception ex)
             {
-                _logger.Error(ex, "初始化数据库失败");
+                _logger.Error(ex, "初始化数据库失败，自动化不会启动以避免 QR 丢失");
+                _cts.Dispose();
+                _cts = null;
+                _db?.Dispose();
+                _db = null;
+                throw;
             }
+
+            _handleTask = Task.Run(() => ProcessNewContent(_cts.Token), _cts.Token);
             StartFileWatcher();
             await InitializeBaselineAsync();
             // 基线已就绪，现在才允许 watcher 触发事件 & 启动轮询线程
@@ -361,15 +404,17 @@ namespace LCPSAutomate
 
         private async Task HandleFileChangeAsync(string filePath, string source = "?")
         {
-            // 尝试读取文件（处理被占用的情况）
-            Thread.Sleep(100);
+            // 给写入方一个短暂的落盘窗口；文件锁保证同一文件不会并发读取。
+            await Task.Delay(100);
 
             try
             {
-                string newContent = string.Empty;
+                string newContent;
                 long lengthBefore;
-                long oldPos;
-                long newPos;
+                long previousPosition = _readRecors.GetOrAdd(filePath, 0);
+                long readFrom = previousPosition;
+                long newPosition;
+
                 using (var fs = new FileStream(
                     filePath,
                     FileMode.Open,
@@ -377,60 +422,45 @@ namespace LCPSAutomate
                     FileShare.ReadWrite))
                 {
                     lengthBefore = fs.Length;
-                    oldPos = _readRecors[filePath];
-
-                    // 如果文件被清空（例如重写）
-                    if (fs.Length < _readRecors[filePath])
+                    if (fs.Length < previousPosition)
                     {
-                        _logger.Warn($"[{source}] 文件被截断/重写: {filePath} 大小={fs.Length} < 上次位置={_readRecors[filePath]}，从头读");
-                        _readRecors[filePath] = 0;
-                        oldPos = 0;
+                        _logger.Warn($"[{source}] 文件被截断/重写: {filePath} 大小={fs.Length} < 上次位置={previousPosition}，从头读");
+                        readFrom = 0;
                     }
 
-                    fs.Seek(_readRecors[filePath], SeekOrigin.Begin);
-
-                    using (var reader = new StreamReader(fs, Encoding.UTF8))
-                    {
-                        newContent = reader.ReadToEnd();
-                        _readRecors[filePath] = fs.Position;
-                    }
-                    newPos = _readRecors[filePath];
+                    fs.Seek(readFrom, SeekOrigin.Begin);
+                    using var reader = new StreamReader(fs, Encoding.UTF8);
+                    newContent = await reader.ReadToEndAsync();
+                    newPosition = fs.Position;
                 }
 
-                var byteDelta = newPos - oldPos;
-                if (!string.IsNullOrEmpty(newContent))
+                var positionChanged = newPosition != previousPosition;
+                if (string.IsNullOrEmpty(newContent) && !positionChanged)
                 {
-                    // 预先看看本次内容里有多少个 QR，便于和提交端日志对账
-                    var qrCount = ExtractQR(newContent).Count();
-                    _logger.Info($"[{source}] 读取 {filePath} | 位置 {oldPos}->{newPos} (+{byteDelta}B) 文件总长={lengthBefore} 字符数={newContent.Length} 匹配QR={qrCount}");
-
-                    _queue.Enqueue(newContent);
-                    _logger.Debug($"[{source}] 已入队，当前处理队列长度≈{_queue.Count}");
-
-                    // 持久化当前读取位置
-                    try
-                    {
-                        if (_db != null)
-                        {
-                            var pos = _readRecors[filePath];
-                            // fire-and-forget but await to ensure write
-                            await _db.UpsertFileReadRecordAsync(new FileReadRecord { FilePath = filePath, LastPosition = pos });
-                            _logger.Debug($"[{source}] 持久化位置: {filePath} @ {pos}");
-                        }
-                        else
-                        {
-                            _logger.Warn($"[{source}] _db 为 null，跳过位置持久化");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Error(ex, $"[{source}] 保存文件读取位置失败");
-                    }
+                    // watcher 和轮询可能先后触发，第二次通常没有新字节。
+                    _logger.Debug($"[{source}] {filePath} 无新内容 (位置={previousPosition} 总长={lengthBefore})");
+                    return;
                 }
-                else
+
+                var qrs = ExtractQR(newContent).Select(qr => qr.Trim()).ToList();
+                _logger.Info($"[{source}] 读取 {filePath} | 位置 {readFrom}->{newPosition} (+{newPosition - readFrom}B) 文件总长={lengthBefore} 字符数={newContent.Length} 匹配QR={qrs.Count}");
+
+                if (_db == null)
                 {
-                    // 这是常见情况（watcher 和轮询同时触发后，第二次读到 0 字节），用 Debug
-                    _logger.Debug($"[{source}] {filePath} 无新内容 (位置={oldPos} 总长={lengthBefore})");
+                    throw new InvalidOperationException("数据库未初始化，拒绝推进文件读取位置");
+                }
+
+                // 待提交 QR 与读取位置必须在同一个事务中落库。事务完成后才更新内存位置和提交队列。
+                var pendingQrs = await _db.PersistPendingRecordsAndFilePositionAsync(
+                    qrs,
+                    new FileReadRecord { FilePath = filePath, LastPosition = newPosition });
+
+                _readRecors[filePath] = newPosition;
+                _logger.Debug($"[{source}] 已原子持久化 {pendingQrs.Count} 个待提交 QR，文件位置={newPosition}");
+
+                foreach (var qr in pendingQrs)
+                {
+                    EnqueuePendingQr(qr, source);
                 }
             }
             catch (IOException ex)
@@ -439,81 +469,186 @@ namespace LCPSAutomate
             }
             catch (Exception ex)
             {
-                _logger.Error(ex, $"[{source}] 处理文件出现未预期异常: {filePath}");
+                _logger.Error(ex, $"[{source}] 处理文件出现未预期异常，读取位置不会推进: {filePath}");
             }
         }
 
-        private async Task Submit(IEnumerable<string> qrList)
+        private async Task SubmitQrAsync(string qr, CancellationToken ct)
         {
-            var qrs = qrList as IList<string> ?? qrList.ToList();
-            _logger.Info($"[Submit] 开始提交 {qrs.Count} 个 QR");
+            const int maxAttempts = 3;
+            string lastError = "未知提交错误";
+
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                var enterPressed = false;
+                try
+                {
+                    ct.ThrowIfCancellationRequested();
+                    using var automation = new UIA3Automation();
+                    var desktop = automation.GetDesktop();
+                    var winElement = desktop.FindFirstChild(cf =>
+                        cf.ByControlType(FlaUI.Core.Definitions.ControlType.Window)
+                            .And(cf.ByName(FlaUIUitls.TARGET_WINDOW_TITLE)));
+                    if (winElement == null)
+                    {
+                        lastError = $"未找到目标窗口 {FlaUIUitls.TARGET_WINDOW_TITLE}";
+                        throw new InvalidOperationException(lastError);
+                    }
+
+                    var window = winElement.AsWindow();
+
+                    // 先处理上一条提交遗留的模态窗口，否则主窗口文本框会处于 Disabled 状态。
+                    var preExistingModal = TryHandleModalWindow(window, qr, "提交前");
+                    if (preExistingModal != null)
+                    {
+                        _logger.Warn($"[Submit] 提交前发现遗留模态窗口，等待主窗口恢复 QR={DescribeQr(qr)} Modal=\"{preExistingModal}\"");
+                        await Task.Delay(300, ct);
+                    }
+
+                    var textBox = await WaitForEnabledTextBoxAsync(window, ct);
+                    if (textBox == null)
+                    {
+                        lastError = $"目标文本框在等待超时后仍不可用 AutomationId={FlaUIUitls.TARGET_TEXT_BOX_AUTOMATION_ID}";
+                        throw new InvalidOperationException(lastError);
+                    }
+
+                    textBox.Focus();
+                    textBox.Text = qr.Trim();
+                    await Task.Delay(200, ct);
+                    FlaUI.Core.Input.Keyboard.Press(FlaUI.Core.WindowsAPI.VirtualKeyShort.ENTER);
+                    enterPressed = true;
+
+                    // 弹窗可能异步出现，不能只在固定的 200ms 时刻检查一次。
+                    var modalTitle = await WaitForAndHandleModalAsync(window, qr, ct);
+                    if (modalTitle != null)
+                    {
+                        lastError = $"HandyClient 返回模态窗口: {modalTitle}";
+                        await SaveSubmitFailureAsync(qr, lastError);
+                        _logger.Warn($"[Submit] FAIL QR={DescribeQr(qr)} Attempt={attempt}/{maxAttempts} Error={lastError}");
+                        return;
+                    }
+
+                    if (_db == null) throw new InvalidOperationException("数据库未初始化");
+                    await _db.MarkRecordProcessedByQrAsync(qr);
+                    _logger.Info($"[Submit] OK QR={DescribeQr(qr)} Attempt={attempt}/{maxAttempts}");
+                    await Task.Delay(200, ct);
+                    return;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastError = $"{ex.GetType().Name}: {ex.Message}";
+                    _logger.Warn(ex, $"[Submit] 尝试失败 QR={DescribeQr(qr)} Attempt={attempt}/{maxAttempts} EnterPressed={enterPressed}");
+
+                    // Enter 已经发出时，结果是不确定的。为避免重复提交，不自动再次按 Enter。
+                    if (enterPressed)
+                    {
+                        lastError = $"提交结果未知（Enter 已发送）: {lastError}";
+                        break;
+                    }
+
+                    if (attempt < maxAttempts)
+                    {
+                        await Task.Delay(500, ct);
+                    }
+                }
+            }
+
+            await SaveSubmitFailureAsync(qr, lastError);
+            _logger.Error($"[Submit] FAIL QR={DescribeQr(qr)} Error={lastError}");
+        }
+
+        private async Task<TextBox?> WaitForEnabledTextBoxAsync(Window window, CancellationToken ct)
+        {
+            const int attempts = 15;
+            for (var attempt = 1; attempt <= attempts; attempt++)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                // 等待期间持续处理可能延迟出现的遗留弹窗。
+                TryHandleModalWindow(window, "<pending>", "等待文本框");
+
+                var element = window.FindFirstDescendant(cf =>
+                    cf.ByAutomationId(FlaUIUitls.TARGET_TEXT_BOX_AUTOMATION_ID));
+                if (element != null && element.IsEnabled)
+                {
+                    return element.AsTextBox();
+                }
+
+                await Task.Delay(200, ct);
+            }
+
+            return null;
+        }
+
+        private async Task<string?> WaitForAndHandleModalAsync(Window window, string qr, CancellationToken ct)
+        {
+            // 最多等待 1.5 秒，覆盖 HandyClient 异步弹窗晚于原 200ms 检查点的情况。
+            const int attempts = 15;
+            for (var attempt = 1; attempt <= attempts; attempt++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var title = TryHandleModalWindow(window, qr, "提交后");
+                if (title != null)
+                {
+                    return title;
+                }
+                await Task.Delay(100, ct);
+            }
+            return null;
+        }
+
+        private string? TryHandleModalWindow(Window window, string qr, string stage)
+        {
+            foreach (var modal in window.ModalWindows)
+            {
+                var title = modal.Title ?? string.Empty;
+                _logger.Warn($"[Submit] {stage}检测到模态窗口 QR={DescribeQr(qr)} Title=\"{title}\"");
+
+                if (title.Contains("错误") || title.Contains("警告"))
+                {
+                    var okButton = modal.FindFirstDescendant(cf =>
+                        cf.ByControlType(FlaUI.Core.Definitions.ControlType.Button)
+                            .And(cf.ByName("确定")))?.AsButton();
+                    if (okButton != null && okButton.IsEnabled)
+                    {
+                        okButton.Invoke();
+                        _logger.Warn($"[Submit] 已关闭模态窗口 QR={DescribeQr(qr)} Title=\"{title}\"");
+                    }
+                    else
+                    {
+                        _logger.Error($"[Submit] 模态窗口中未找到可用的“确定”按钮 QR={DescribeQr(qr)} Title=\"{title}\"");
+                    }
+                }
+                else
+                {
+                    _logger.Error($"[Submit] 未识别的模态窗口，不执行盲目点击 QR={DescribeQr(qr)} Title=\"{title}\"");
+                }
+
+                return string.IsNullOrWhiteSpace(title) ? "<无标题>" : title;
+            }
+
+            return null;
+        }
+
+        private async Task SaveSubmitFailureAsync(string qr, string error)
+        {
             try
             {
-                using var automation = new UIA3Automation();
-                var desktop = automation.GetDesktop();
-                var winElement = desktop.FindFirstChild(cf => cf.ByControlType(FlaUI.Core.Definitions.ControlType.Window).And(cf.ByName(FlaUIUitls.TARGET_WINDOW_TITLE))).AsWindow();
-                if (winElement == null)
+                if (_db == null)
                 {
-                    _logger.Warn($"[Submit] 未找到目标窗口 \"{FlaUIUitls.TARGET_WINDOW_TITLE}\"，丢弃本批 {qrs.Count} 个 QR");
+                    _logger.Error($"[Submit] 数据库未初始化，无法保存失败状态 QR={DescribeQr(qr)} Error={error}");
                     return;
                 }
 
-                var window = winElement.AsWindow();
-                var tbElement = window.FindFirstDescendant(cf => cf.ByAutomationId(FlaUIUitls.TARGET_TEXT_BOX_AUTOMATION_ID));
-                if (tbElement == null)
-                {
-                    _logger.Warn($"[Submit] 未找到目标文本框 AutomationId={FlaUIUitls.TARGET_TEXT_BOX_AUTOMATION_ID}，丢弃本批 {qrs.Count} 个 QR");
-                    return;
-                }
-
-                var tb = tbElement.AsTextBox();
-                int ok = 0, failed = 0;
-                foreach (var qr in qrs)
-                {
-                    tb.Text = qr.Trim();
-                    await Task.Delay(200);
-                    FlaUI.Core.Input.Keyboard.Press(FlaUI.Core.WindowsAPI.VirtualKeyShort.ENTER);
-                    await Task.Delay(200);
-                    // 判断是否弹出了错误弹窗
-                    var isProcessed = true;
-                    foreach (var modal in window.ModalWindows)
-                    {
-                        var title = modal.Title;
-                        if (title.Contains("错误") || title.Contains("警告"))
-                        {
-                            var okButton = modal.FindFirstChild(cf => cf.ByControlType(FlaUI.Core.Definitions.ControlType.Button).And(cf.ByName("确定")))?.AsButton();
-                            okButton?.Invoke();
-                            _logger.Warn($"[Submit] QR={qr} 出现弹窗 标题=\"{title}\"，已点确定");
-                            isProcessed = false;
-                        }
-                    }
-                    if (isProcessed) ok++; else failed++;
-                    try
-                    {
-                        if (_db != null)
-                        {
-                            await _db.AddOrIgnoreRecordAsync(new Records { Qr = qr, IsProcessed = isProcessed });
-                            await _db.MarkRecordProcessedByQrAsync(qr);
-                        }
-                        else
-                        {
-                            using var dataAccess = new SqliteDataAccess();
-                            await dataAccess.AddOrIgnoreRecordAsync(new Records { Qr = qr, IsProcessed = isProcessed });
-                            await dataAccess.MarkRecordProcessedByQrAsync(qr);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Error(ex, $"[Submit] 保存 QR 到数据库失败 QR={qr}");
-                    }
-                    _logger.Info($"[Submit] {(isProcessed ? "OK" : "FAIL")} QR={qr}");
-                    await Task.Delay(200);
-                }
-                _logger.Info($"[Submit] 本批完成 成功={ok} 失败={failed}");
+                await _db.MarkRecordFailedByQrAsync(qr, error);
             }
             catch (Exception ex)
             {
-                _logger.Error(ex, "[Submit] 提交过程出现异常");
+                _logger.Error(ex, $"[Submit] 保存失败状态异常 QR={DescribeQr(qr)} OriginalError={error}");
             }
         }
 

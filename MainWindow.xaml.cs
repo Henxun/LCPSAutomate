@@ -10,6 +10,9 @@ namespace LCPSAutomate
         private Automate? _automate;
         private System.Timers.Timer? _timer;
         private CancellationTokenSource _cts;
+        private int _consecutiveWindowDetectionFailures;
+        private int _isStarting;
+        private const int WindowDetectionFailureThreshold = 3;
         private readonly Logger _logger = LogManager.GetCurrentClassLogger();
 
         public MainWindow()
@@ -40,47 +43,56 @@ namespace LCPSAutomate
                 System.Windows.MessageBox.Show("未选择路径");
                 return;
             }
+
+            // 启动期间立即加门闩，避免用户连续点击创建多个 Automate 实例并发操作 HandyClient。
+            if (_automate != null || Interlocked.CompareExchange(ref _isStarting, 1, 0) != 0)
+            {
+                return;
+            }
+
             var directoryToWatch = FolderTextBox.Text;
+            StartButton.IsEnabled = false;
+            BrowseButton.IsEnabled = false;
 
             Task.Run(async () =>
             {
-                var isReady = FlaUIUitls.DetectWindow();
-                OnStatusChanged(isReady);
-                if (isReady)
+                var started = false;
+                try
                 {
-                    _automate = new Automate(directoryToWatch);
-                    await _automate.Start();
-
-                    this.Dispatcher.Invoke(() =>
+                    var isReady = FlaUIUitls.DetectWindow();
+                    OnStatusChanged(isReady);
+                    if (!isReady)
                     {
-                        StartButton.IsEnabled = false;
-                        BrowseButton.IsEnabled = false;
+                        return;
+                    }
+
+                    var automate = new Automate(directoryToWatch);
+                    await automate.Start();
+                    _automate = automate;
+                    _consecutiveWindowDetectionFailures = 0;
+                    started = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error(ex, "启动自动化失败");
+                    Dispatcher.Invoke(() =>
+                    {
+                        StatusTextBlock.Text = "启动失败，请查看错误日志。";
+                        StatusTextBlock.Foreground = System.Windows.Media.Brushes.Red;
                     });
                 }
-            });
-
-            // 使用当前选中的文件夹路径
-            string targetDirectory = FolderTextBox.Text;
-
-            // 20秒后启动日志写入线程
-            Task.Delay(1000).ContinueWith(_ =>
-            {
-                Task.Run(() =>
+                finally
                 {
-                    LogWriterTest logWriter = new LogWriterTest(targetDirectory);
-                    for(var i = 0; i < 10; i++)
+                    Interlocked.Exchange(ref _isStarting, 0);
+                    if (!started)
                     {
-                        try
+                        Dispatcher.Invoke(() =>
                         {
-                            logWriter.WriteTestLog();
-                            _logger.Info($"测试日志已成功写入到: {targetDirectory}");
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.Error($"写入测试日志时发生错误: {ex.Message}");
-                        }
+                            StartButton.IsEnabled = true;
+                            BrowseButton.IsEnabled = true;
+                        });
                     }
-                });
+                }
             });
         }
 
@@ -134,14 +146,32 @@ namespace LCPSAutomate
         {
             while (!ct.IsCancellationRequested)
             {
-
                 var isReady = FlaUIUitls.DetectWindow();
                 OnStatusChanged(isReady);
-                if (!isReady)
+                if (isReady)
                 {
-                    _automate?.Stop();
+                    _consecutiveWindowDetectionFailures = 0;
                 }
-                await Task.Delay(1000, ct).ContinueWith(_ => { }, TaskScheduler.Default);
+                else
+                {
+                    var failures = Interlocked.Increment(ref _consecutiveWindowDetectionFailures);
+                    _logger.Warn($"目标窗口连续检测失败 {failures}/{WindowDetectionFailureThreshold}");
+                    if (failures >= WindowDetectionFailureThreshold && _automate != null)
+                    {
+                        _logger.Error("目标窗口连续检测失败达到阈值，停止自动化");
+                        var automate = _automate;
+                        _automate = null;
+                        automate.Stop();
+                        Dispatcher.Invoke(() =>
+                        {
+                            StartButton.IsEnabled = true;
+                            BrowseButton.IsEnabled = true;
+                        });
+                    }
+                }
+
+                try { await Task.Delay(1000, ct); }
+                catch (TaskCanceledException) { break; }
             }
         }
     }
